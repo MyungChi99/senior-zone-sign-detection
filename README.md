@@ -94,7 +94,8 @@ python detect_realtime.py --model models/yolov4-tiny.tflite
 
 ---
 ## 개선점을 반영한 새로운 프로젝트 기획
-2025년 임베디드 공모전을 위한 프로젝트 계획서를 해당 프로젝트에서 배운 한계점들을 바탕으로 재설계 하였습니다.
+- 2025년 임베디드 공모전을 위한 프로젝트 계획서를 해당 프로젝트에서 배운 한계점들을 바탕으로 재설계 하였습니다.
+- [2025ESWContest_모빌리티_6120_MUX4_개발계획서.docx](https://github.com/user-attachments/files/22085052/2025ESWContest_._6120_MUX4_.docx)
 
 
 
