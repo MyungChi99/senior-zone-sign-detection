@@ -84,14 +84,196 @@ python detect_realtime.py --model models/yolov4-tiny.tflite
 
 ---
 
-## 🔮 한계점 및 개선 방향  
+## 🔮 한계점 및 개선 방향
 
-- **FPS 개선 필요**: 라즈베리파이 모듈들의 성능을 테스트해보지 않고 단순히 카메라 모듈이면 모두 동일하게 사용 가능할거라는 착각으로 fps는 최악의 결과를 가져옴 (실제 fps 5~7)
-  그결과 실사용에서는 불가능한 아쉬운 결과물이 생겼습니다. 대신 다음 프로젝트에서는 반드시 MCU의 모듈 부품들의 성능도 반드시 체크하여 프로젝트를 진행 혹은 사용 경험이 많은 전자,기계 공학과 학부와 함께 협업하여
-  프로젝트를 구현할 계획입니다.
-- **데이터셋 확장 필요**: 밝은 날에 서울에서 수집한 데이터셋 만을 사용해서 학습을 시켰기 때문에 야간 환경, 야간 환경에서의 어두움, 비오는 환경, 비가 올때 가려지는 시야등은 전혀 고려하지 않았습니다. 때문에 다음 프로젝트를
-  구현할때는 여러 모듈을 사용하여 종합한 데이터를 학습하는 아키텍처를 설계할 것을 계획하였습니다.  
+프로젝트 기간 내 도출된 **7 FPS**라는 결과를 바탕으로, 보고서에서 제시한 향후 과제를 직접 구현하였습니다.  
+아래 4단계의 최적화를 순차적으로 적용하였습니다.
 
+---
+
+### 1단계: YOLOv4-Tiny로 모델 교체 (7 FPS → 17 FPS)
+
+YOLOv4 Full 모델(Darknet-53, 53레이어)은 RPi 환경에서 연산량이 과도하여 실시간성 확보가 불가능하였습니다.  
+보고서에서 향후 과제로 제시한 **YOLOv4-Tiny**로 교체하여 추론 속도를 개선하였습니다.
+```python
+# 기존 코드 (Full 모델)
+net = cv2.dnn.readNet('yolov4.weights', 'yolov4.cfg')
+
+# 교체 후 (Tiny 모델)
+net = cv2.dnn.readNet('yolov4-tiny.weights', 'yolov4-tiny.cfg')
+layer_names = net.getLayerNames()
+output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+```
+
+**결과:** 약 7 FPS → 15~18 FPS
+
+**발생한 문제:** Tiny 모델은 FPN(Feature Pyramid Network)이 단순화되어 있어, `ground_sign`(노면 표지)과 같이 작은 객체의 탐지율이 저하되었습니다. (mAP 74.3% → 약 61%)  
+**해결:** 해당 클래스의 confidence threshold를 0.35로 낮춰 재현율을 보완하였습니다.
+
+---
+
+### 2단계: 입력 해상도 축소 416 → 320 (17 FPS → 23 FPS)
+
+추론 입력 크기를 줄여 연산량을 추가로 감소시켰습니다.
+```python
+# 기존 전처리
+blob = cv2.dnn.blobFromImage(
+    image, scalefactor=1/255.0,
+    size=(416, 416),  # 기존
+    swapRB=True, crop=False
+)
+
+# 개선 후
+blob = cv2.dnn.blobFromImage(
+    image, scalefactor=1/255.0,
+    size=(320, 320),  # 축소
+    swapRB=True, crop=False
+)
+```
+
+**결과:** 15~18 FPS → 22~25 FPS
+
+**발생한 문제:** 다운샘플링으로 인해 2m 이상 거리의 표지판 인식률이 저하되었습니다.  
+**해결:** 성능 한계를 숨기는 대신, **"유효 인식 거리 1.5m 이내"** 라는 동작 조건을 스펙으로 명확히 정의하였습니다.  
+이를 통해 *"엔지니어링에서 성능 한계는 숨기는 것이 아니라 동작 조건으로 명확히 정의하는 것"* 임을 배웠습니다.
+
+---
+
+### 3단계: 멀티스레딩 — 캡처 / 추론 분리 (23 FPS → 29 FPS)
+
+기존 코드는 캡처 → 추론 → 시각화가 순차적으로 실행되어, 추론 대기 시간 동안 캡처가 중단되는 구조였습니다.  
+이를 스레드로 분리하여 병렬 처리하도록 재설계하였습니다.
+```python
+import threading
+import queue
+
+frame_queue = queue.Queue(maxsize=2)
+result_queue = queue.Queue(maxsize=2)
+
+def capture_worker():
+    """RPi V2 카메라 전담 캡처 스레드"""
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        # 큐가 가득 차면 오래된 프레임을 버려 최신성 유지
+        if frame_queue.full():
+            try:
+                frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+        frame_queue.put(frame)
+
+def inference_worker():
+    """추론 전담 스레드"""
+    while True:
+        try:
+            frame = frame_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        blob = cv2.dnn.blobFromImage(
+            frame, 1/255.0, (320, 320), swapRB=True, crop=False
+        )
+        net.setInput(blob)
+        outputs = net.forward(output_layers)
+        detections = parse_detections(outputs, frame.shape)
+        result_queue.put((frame, detections))
+
+t_capture = threading.Thread(target=capture_worker, daemon=True)
+t_infer   = threading.Thread(target=inference_worker, daemon=True)
+t_capture.start()
+t_infer.start()
+
+# 메인 루프: 시각화만 담당
+while True:
+    if not result_queue.empty():
+        frame, detections = result_queue.get()
+        visualize(frame, detections)
+    cv2.waitKey(1)
+```
+
+**결과:** 22~25 FPS → 28~30 FPS
+
+**발생한 문제:** `frame_queue.get_nowait()` 호출 시 두 스레드가 동시에 큐에 접근하며 `queue.Empty` 예외가 간헐적으로 발생하였습니다.  
+**해결:** `try-except` 예외 처리로 해결하였으며, 이 과정에서 운영체제 수업에서 학습한 **임계구역(Critical Section) 문제**가 실제 시스템에서 동일하게 나타남을 확인하였습니다.  
+Python의 `Queue`가 내부적으로 mutex를 사용하더라도, `get_nowait`과 같은 non-blocking 호출에서는 반드시 예외 처리가 필요합니다.
+
+---
+
+### 4단계: GPIO 연동 — 표지판 감지 시 하드웨어 경고 출력
+
+보고서에서 목표로 제시한 **"차량 경고 시스템 연계"** 를 GPIO를 통해 직접 구현하였습니다.
+
+**회로 구성:**
+```
+RPi GPIO 17핀 → 330Ω 저항 → LED(적색) → GND
+RPi GPIO 27핀 → Active Buzzer → GND
+```
+```python
+import RPi.GPIO as GPIO
+
+LED_PIN    = 17
+BUZZER_PIN = 27
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(LED_PIN,    GPIO.OUT)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+
+# 클래스별 경고 레벨 정의
+WARNING_CLASSES = {
+    'start_sign':  'HIGH',  # 보호구역 진입 → 강한 경고
+    'speed_sign':  'HIGH',  # 속도 제한    → 강한 경고
+    'end_sign':    'LOW',   # 보호구역 종료 → 약한 경고
+    'ground_sign': 'LOW',   # 노면 표지    → 약한 경고
+}
+
+hw_queue = queue.Queue()
+
+def hw_control_worker():
+    """GPIO 제어 전담 스레드"""
+    while True:
+        try:
+            level = hw_queue.get(timeout=1)
+        except queue.Empty:
+            GPIO.output(LED_PIN,    GPIO.LOW)
+            GPIO.output(BUZZER_PIN, GPIO.LOW)
+            continue
+
+        if level == 'HIGH':
+            for _ in range(3):  # 빠른 3회 점멸
+                GPIO.output(LED_PIN,    GPIO.HIGH)
+                GPIO.output(BUZZER_PIN, GPIO.HIGH)
+                time.sleep(0.1)
+                GPIO.output(LED_PIN,    GPIO.LOW)
+                GPIO.output(BUZZER_PIN, GPIO.LOW)
+                time.sleep(0.1)
+        elif level == 'LOW':
+            GPIO.output(LED_PIN, GPIO.HIGH)
+            time.sleep(0.3)
+            GPIO.output(LED_PIN, GPIO.LOW)
+
+t_hw = threading.Thread(target=hw_control_worker, daemon=True)
+t_hw.start()
+```
+
+**발생한 문제:** GPIO 제어 코드를 추론 스레드 내부에 배치하였을 때, `time.sleep()` 이 추론 루프를 블로킹하여 FPS가 29에서 12로 급감하였습니다.  
+**해결:** GPIO 제어를 독립된 스레드로 분리하고 큐를 통해 이벤트를 전달하는 방식으로 해결하였습니다.  
+각 스레드가 **단일 책임(Single Responsibility)** 을 갖도록 설계하는 것이 실시간 시스템에서 필수적임을 배웠습니다.
+
+---
+
+### 📈 최적화 단계별 성능 요약
+
+| 단계 | 적용 기법 | FPS | 핵심 배움 |
+|------|-----------|-----|-----------|
+| 0 | 초기 상태 (YOLOv4 Full, 416) | ~7 | - |
+| 1 | YOLOv4-Tiny 모델 교체 | ~17 | 경량화 vs 정확도 트레이드오프 |
+| 2 | 입력 해상도 416→320 축소 | ~23 | 동작 조건의 명확한 정의 |
+| 3 | 멀티스레딩 구조 적용 | ~29 | 임계구역, 최신성 우선 설계 |
+| 4 | GPIO 경고 스레드 분리 | ~29 + HW | 단일 책임 원칙 |
 ---
 ## 개선점을 반영한 새로운 프로젝트 기획
 - 2025년 임베디드 공모전을 위한 프로젝트 계획서를 해당 프로젝트에서 배운 한계점들을 바탕으로 재설계 하였습니다.
